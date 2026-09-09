@@ -8,9 +8,9 @@ use std::{
 };
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, DefiniteLength, FocusHandle, FollowMode, IntoElement,
-    KeyBinding, ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
-    Task, Window, prelude::FluentBuilder as _, px,
+    App, AppContext as _, Bounds, Context, DefiniteLength, FocusHandle, FollowMode,
+    FollowTailReengagement, IntoElement, KeyBinding, ListState, ParentElement as _, Pixels, Point,
+    Render, SharedString, Styled as _, Task, Window, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -286,6 +286,17 @@ impl TextViewState {
     /// Set how a scrollable text view follows content added at its end.
     pub fn set_follow_mode(&mut self, mode: FollowMode, cx: &mut Context<Self>) {
         self.list_state.set_follow_mode(mode);
+        cx.notify();
+    }
+
+    /// Configure where suspended tail-following resumes.
+    pub fn set_follow_tail_reengagement(
+        &mut self,
+        reengagement: FollowTailReengagement,
+        cx: &mut Context<Self>,
+    ) {
+        self.list_state
+            .set_follow_tail_reengagement(reengagement);
         cx.notify();
     }
 
