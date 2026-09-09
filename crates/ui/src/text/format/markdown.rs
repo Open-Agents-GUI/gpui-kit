@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use gpui::SharedString;
 use markdown::mdast::{self, Node};
@@ -239,7 +239,9 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
         }
         Node::Html(val) => match super::html::parse(&val.value, cx) {
             Ok(el) => {
-                if let Some(inline_text) = append_inline_html_blocks(paragraph, el.blocks) {
+                if let Some(inline_text) =
+                    append_inline_html_blocks(paragraph, Arc::unwrap_or_clone(el.blocks))
+                {
                     text = inline_text;
                 } else {
                     if cfg!(debug_assertions) {
@@ -305,8 +307,44 @@ fn ast_to_document(source: &str, root: mdast::Node, cx: &mut NodeContext) -> Par
         .collect();
     ParsedDocument {
         source: source.to_string().into(),
-        blocks,
+        blocks: Arc::new(virtualize_top_level_lists(blocks)),
     }
+}
+
+/// Promote top-level list items to document blocks. `TextView` virtualizes
+/// document blocks, so retaining a whole list as one block makes every item
+/// participate in every scroll frame.
+fn virtualize_top_level_lists(blocks: Vec<BlockNode>) -> Vec<BlockNode> {
+    let mut result = Vec::with_capacity(blocks.len());
+
+    for block in blocks {
+        match block {
+            BlockNode::List {
+                children,
+                ordered,
+                start,
+                span: list_span,
+            } if children.len() > 1 => {
+                let last_ix = children.len() - 1;
+                result.reserve(children.len());
+                for (ix, child) in children.into_iter().enumerate() {
+                    let span = child.span();
+                    result.push(BlockNode::VirtualListItem {
+                        child: Box::new(child),
+                        ordered,
+                        item_ix: start + ix,
+                        continues_previous: ix > 0,
+                        is_last: ix == last_ix,
+                        list_span,
+                        span,
+                    });
+                }
+            }
+            block => result.push(block),
+        }
+    }
+
+    result
 }
 
 fn new_span(pos: Option<markdown::unist::Position>, cx: &NodeContext) -> Option<Span> {
@@ -355,6 +393,7 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
                 .collect();
             BlockNode::List {
                 ordered: list.ordered,
+                start: list.start.unwrap_or(1).saturating_sub(1) as usize,
                 children,
                 span: new_span(list.position, cx),
             }
@@ -400,7 +439,7 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
         )),
         Node::Html(val) => match super::html::parse(&val.value, cx) {
             Ok(el) => BlockNode::Root {
-                children: el.blocks,
+                children: Arc::unwrap_or_clone(el.blocks),
                 span: new_span(val.position, cx),
             },
             Err(err) => {
@@ -511,6 +550,28 @@ mod tests {
     use gpui::ParentElement;
 
     use crate::text::{MarkdownExtensions, MarkdownNode, MarkdownPlugin};
+
+    #[test]
+    fn top_level_list_items_are_independent_virtual_blocks() {
+        let mut cx = NodeContext::default();
+        let document = parse("3. three\n4. four\n5. five\n", &mut cx).unwrap();
+
+        assert_eq!(document.blocks.len(), 3);
+        for (expected_ix, block) in (2..5).zip(document.blocks.iter()) {
+            let BlockNode::VirtualListItem {
+                ordered,
+                item_ix,
+                continues_previous,
+                ..
+            } = block
+            else {
+                panic!("expected independently virtualized list item");
+            };
+            assert!(*ordered);
+            assert_eq!(*item_ix, expected_ix);
+            assert_eq!(*continues_previous, expected_ix > 2);
+        }
+    }
 
     #[test]
     fn test_nested_emphasis_merges_text_marks() {

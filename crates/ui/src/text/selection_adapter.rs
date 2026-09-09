@@ -72,7 +72,10 @@ impl VirtualBlockSelection {
 #[derive(Clone)]
 pub(super) struct TextViewSelectionAdapter {
     selection: TextSelectionHandle,
-    text_bounds: Vec<Bounds<Pixels>>,
+    /// Per-frame geometry is produced and consumed on the UI thread. Sharing
+    /// the buffer directly avoids an `Entity::update` for every visible inline
+    /// during paint.
+    text_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     layout_revision: Option<usize>,
 }
 
@@ -167,7 +170,7 @@ impl TextViewSelectionAdapter {
 
         Self {
             selection,
-            text_bounds: Vec::new(),
+            text_bounds: Rc::new(RefCell::new(Vec::new())),
             layout_revision: None,
         }
     }
@@ -182,12 +185,12 @@ impl TextViewSelectionAdapter {
         changed && !is_selecting
     }
 
-    pub(super) fn begin_frame(&mut self) {
-        self.text_bounds.clear();
+    pub(super) fn begin_frame(&self) {
+        self.text_bounds.borrow_mut().clear();
     }
 
-    pub(super) fn register_inline(&mut self, bounds: Vec<Bounds<Pixels>>) {
-        self.text_bounds.extend(bounds);
+    pub(super) fn register_inline(&self, bounds: Vec<Bounds<Pixels>>) {
+        self.text_bounds.borrow_mut().extend(bounds);
     }
 
     pub(super) fn register(
@@ -203,7 +206,7 @@ impl TextViewSelectionAdapter {
             TextSelectionRegistration::new(hitbox, bounds)
                 .with_scroll_offset(scroll_offset)
                 .with_document_order(document_order)
-                .with_text_bounds(self.text_bounds.clone()),
+                .with_text_bounds(self.text_bounds.borrow().clone()),
             window,
             cx,
         );
@@ -231,6 +234,6 @@ impl TextViewSelectionAdapter {
 
     #[cfg(test)]
     pub(super) fn text_bounds(&self) -> Vec<Bounds<Pixels>> {
-        self.text_bounds.clone()
+        self.text_bounds.borrow().clone()
     }
 }

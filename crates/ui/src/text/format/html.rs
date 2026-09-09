@@ -75,7 +75,7 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
 
     Ok(ParsedDocument {
         source: source.to_string().into(),
-        blocks: vec![node],
+        blocks: vec![node].into(),
     })
 }
 
@@ -503,6 +503,7 @@ fn parse_node(
                 Some(BlockNode::List {
                     children,
                     ordered,
+                    start: 0,
                     span: None,
                 })
             }

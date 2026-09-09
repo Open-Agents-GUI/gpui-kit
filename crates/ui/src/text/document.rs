@@ -1,12 +1,13 @@
 use gpui::{
-    App, InteractiveElement as _, IntoElement, ListState, ParentElement as _, SharedString,
-    Styled as _, Window, div,
+    AnyElement, App, DefiniteLength, InteractiveElement as _, IntoElement, ListState,
+    ParentElement as _, SharedString, Styled as _, Window, div, prelude::*
 };
 
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, sync::Arc};
 
 use crate::text::{
     SelectionFormat,
+    inline::TextFade,
     node::{BlockNode, NodeContext},
 };
 
@@ -14,7 +15,10 @@ use crate::text::{
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct ParsedDocument {
     pub(crate) source: SharedString,
-    pub(crate) blocks: Vec<BlockNode>,
+    /// The render closure owned by `gpui::list` must be `'static`. Keeping the
+    /// AST behind an `Arc` makes the per-frame clone below constant-time instead
+    /// of recursively cloning the entire Markdown document while scrolling.
+    pub(crate) blocks: Arc<Vec<BlockNode>>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -112,7 +116,7 @@ impl ParsedDocument {
             return text;
         }
 
-        let mut out: Vec<String> = Vec::new();
+        let mut out = String::new();
         for (ix, block) in self.blocks.iter().enumerate().take(last + 1).skip(first) {
             // The selection is one continuous range, so only the block it
             // starts in and the block it ends in can be partly selected.
@@ -128,10 +132,20 @@ impl ParsedDocument {
 
             let trimmed = source.trim_end_matches('\n');
             if !trimmed.is_empty() {
-                out.push(trimmed.to_string());
+                if !out.is_empty() {
+                    // Long top-level lists are split into independently
+                    // virtualized items. Keep their copied Markdown a single
+                    // list rather than inserting a blank line between items.
+                    if block.continues_virtual_list() {
+                        out.push('\n');
+                    } else {
+                        out.push_str("\n\n");
+                    }
+                }
+                out.push_str(trimmed);
             }
         }
-        out.join("\n\n")
+        out
     }
 
     /// The whole source of a block the selection covers.
@@ -163,6 +177,12 @@ impl ParsedDocument {
         }
     }
 
+    pub(super) fn apply_text_fades_by_block(&self, fades: &[Vec<TextFade>]) {
+        for (ix, block) in self.blocks.iter().enumerate() {
+            block.apply_text_fades(fades.get(ix).map(Vec::as_slice).unwrap_or_default());
+        }
+    }
+
     /// Converts the node to markdown format.
     ///
     /// This is used to generate markdown for test.
@@ -178,6 +198,8 @@ impl ParsedDocument {
     pub(super) fn render_root(
         &self,
         list_state: Option<ListState>,
+        content_max_width: Option<DefiniteLength>,
+        scroll_bottom_padding: Option<DefiniteLength>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -188,15 +210,19 @@ impl ParsedDocument {
                 .id("document")
                 .children(self.blocks.iter().enumerate().map(move |(ix, node)| {
                     let is_last = ix + 1 == blocks_len;
-                    node.render_block(
-                        NodeRenderOptions {
-                            ix,
-                            is_last,
-                            ..Default::default()
-                        },
-                        node_cx,
-                        window,
-                        cx,
+                    render_content_column(
+                        ix,
+                        content_max_width,
+                        node.render_block(
+                            NodeRenderOptions {
+                                ix,
+                                is_last,
+                                ..Default::default()
+                            },
+                            node_cx,
+                            window,
+                            cx,
+                        ),
                     )
                 }));
         };
@@ -206,7 +232,7 @@ impl ParsedDocument {
             ..Default::default()
         };
 
-        let blocks = &self.blocks;
+        let blocks = self.blocks.clone();
 
         if list_state.item_count() != blocks.len() {
             list_state.reset(blocks.len());
@@ -218,8 +244,10 @@ impl ParsedDocument {
                 let blocks = blocks.clone();
                 move |ix, window, cx| {
                     let is_last = ix + 1 == blocks.len();
-                    blocks[ix]
-                        .render_block(
+                    render_content_column(
+                        ix,
+                        content_max_width,
+                        blocks[ix].render_block(
                             NodeRenderOptions {
                                 ix,
                                 is_last,
@@ -228,11 +256,38 @@ impl ParsedDocument {
                             &node_cx,
                             window,
                             cx,
-                        )
-                        .into_any_element()
+                        ),
+                    )
                 }
             })
-            .size_full(),
+            .size_full()
+            .when_some(scroll_bottom_padding, |list, padding| list.pb(padding)),
         )
     }
+}
+
+fn render_content_column(
+    ix: usize,
+    max_width: Option<DefiniteLength>,
+    block: AnyElement,
+) -> AnyElement {
+    let Some(max_width) = max_width else {
+        return block;
+    };
+
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .id(("content-column", ix))
+                .debug_selector(move || format!("text-view-content-column-{ix}"))
+                .w_full()
+                .min_w_0()
+                .max_w(max_width)
+                .child(block),
+        )
+        .into_any_element()
 }

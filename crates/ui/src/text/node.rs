@@ -22,7 +22,7 @@ use crate::{
     text::{
         CodeBlockActionsFn, LinkClickHandlerFn, MarkdownExtensions, MarkdownNode,
         document::NodeRenderOptions,
-        inline::{Inline, InlineState},
+        inline::{Inline, InlineState, TextFade},
         inline_flow::{InlineFlow, InlineFlowItem},
         text_view::handle_link_click,
     },
@@ -62,6 +62,22 @@ pub(crate) enum BlockNode {
         /// Only contains ListItem, others will be ignored
         children: Vec<BlockNode>,
         ordered: bool,
+        /// Zero-based number of the first item (ignored for unordered lists).
+        start: usize,
+        span: Option<Span>,
+    },
+    /// One top-level list item promoted to a document block so `gpui::list`
+    /// can virtualize it independently. Nested lists keep using `List`.
+    VirtualListItem {
+        child: Box<BlockNode>,
+        ordered: bool,
+        /// Zero-based displayed item number.
+        item_ix: usize,
+        continues_previous: bool,
+        is_last: bool,
+        /// Full source span of the original list, used by append reparsing.
+        list_span: Option<Span>,
+        /// Source span of this individual item, used by selection copying.
         span: Option<Span>,
     },
     ListItem {
@@ -122,6 +138,7 @@ impl BlockNode {
             BlockNode::Heading { span, .. } => *span,
             BlockNode::Blockquote { span, .. } => *span,
             BlockNode::List { span, .. } => *span,
+            BlockNode::VirtualListItem { span, .. } => *span,
             BlockNode::ListItem { span, .. } => *span,
             BlockNode::CodeBlock(code_block) => code_block.span,
             BlockNode::Custom(el) => el.span,
@@ -131,6 +148,23 @@ impl BlockNode {
             BlockNode::Definition { span, .. } => *span,
             BlockNode::Unknown { .. } => None,
         }
+    }
+
+    pub(super) fn reparse_start(&self) -> Option<usize> {
+        match self {
+            BlockNode::VirtualListItem { list_span, .. } => list_span.map(|span| span.start),
+            _ => self.span().map(|span| span.start),
+        }
+    }
+
+    pub(super) fn continues_virtual_list(&self) -> bool {
+        matches!(
+            self,
+            BlockNode::VirtualListItem {
+                continues_previous: true,
+                ..
+            }
+        )
     }
 
     pub(super) fn text(&self) -> String {
@@ -189,14 +223,34 @@ impl BlockNode {
                 }
             }
             BlockNode::List {
-                children, ordered, ..
+                children,
+                ordered,
+                start,
+                ..
             } => {
                 if matches!(kind, BlockTextKind::SelectedSource) {
                     // Reconstruct the list source, indenting nested lists and
                     // restoring list markers and task-list checkboxes.
-                    text.push_str(&list_selected_source(children, *ordered, ""));
+                    text.push_str(&list_selected_source(children, *ordered, *start, ""));
                 } else {
                     text.push_str(&Self::children_text(children, kind));
+                }
+            }
+            BlockNode::VirtualListItem {
+                child,
+                ordered,
+                item_ix,
+                ..
+            } => {
+                if matches!(kind, BlockTextKind::SelectedSource) {
+                    text.push_str(&list_selected_source(
+                        std::slice::from_ref(child.as_ref()),
+                        *ordered,
+                        *item_ix,
+                        "",
+                    ));
+                } else {
+                    text.push_str(&child.text_by_kind(kind));
                 }
             }
             BlockNode::ListItem { children, .. } => {
@@ -314,6 +368,7 @@ impl BlockNode {
             | BlockNode::ListItem { children, .. } => {
                 children.iter().any(|child| child.has_selection())
             }
+            BlockNode::VirtualListItem { child, .. } => child.has_selection(),
             BlockNode::Paragraph(paragraph) => paragraph.has_selection(),
             BlockNode::Heading { children, .. } => children.has_selection(),
             BlockNode::Table(table) => table.children.iter().any(|row| {
@@ -340,6 +395,7 @@ impl BlockNode {
                     child.clear_selection();
                 }
             }
+            BlockNode::VirtualListItem { child, .. } => child.clear_selection(),
             BlockNode::Paragraph(paragraph) => paragraph.clear_selection(),
             BlockNode::Heading { children, .. } => children.clear_selection(),
             BlockNode::Table(table) => {
@@ -356,6 +412,75 @@ impl BlockNode {
             | BlockNode::HorizontalRule { .. }
             | BlockNode::Unknown { .. } => {}
         }
+    }
+
+    pub(super) fn apply_text_fades(&self, fades: &[TextFade]) {
+        let mut cursor = 0;
+        self.apply_text_fades_at(fades, &mut cursor);
+    }
+
+    fn apply_text_fades_at(&self, fades: &[TextFade], cursor: &mut usize) {
+        let start = *cursor;
+        match self {
+            BlockNode::Root { children, .. }
+            | BlockNode::Blockquote { children, .. }
+            | BlockNode::List { children, .. }
+            | BlockNode::ListItem { children, .. } => {
+                for child in children {
+                    child.apply_text_fades_at(fades, cursor);
+                }
+            }
+            BlockNode::VirtualListItem { child, .. } => {
+                child.apply_text_fades_at(fades, cursor);
+            }
+            BlockNode::Paragraph(paragraph) => paragraph.apply_text_fades(fades, cursor),
+            BlockNode::Heading { children, .. } => children.apply_text_fades(fades, cursor),
+            BlockNode::Table(table) => {
+                for row in &table.children {
+                    for (cell_ix, cell) in row.children.iter().enumerate() {
+                        if cell_ix > 0 {
+                            *cursor += 1;
+                        }
+                        cell.children.apply_text_fades(fades, cursor);
+                    }
+                    *cursor += 1;
+                }
+                if !table.children.is_empty() {
+                    *cursor += 1;
+                }
+            }
+            BlockNode::CodeBlock(code_block) => {
+                let len = code_block.code().len();
+                set_state_fades(&code_block.state, *cursor, len, fades);
+                *cursor += len;
+            }
+            BlockNode::Custom { .. }
+            | BlockNode::Definition { .. }
+            | BlockNode::Break { .. }
+            | BlockNode::HorizontalRule { .. }
+            | BlockNode::Unknown { .. } => {}
+        }
+
+        // Keep the cursor exactly aligned with `text()`, including structural
+        // separators that do not belong to any rendered inline.
+        *cursor = start + self.text().len();
+    }
+}
+
+fn set_state_fades(state: &Arc<Mutex<InlineState>>, start: usize, len: usize, fades: &[TextFade]) {
+    let end = start + len;
+    let local_fades = fades
+        .iter()
+        .filter_map(|fade| {
+            let overlap_start = fade.range.start.max(start);
+            let overlap_end = fade.range.end.min(end);
+            (overlap_start < overlap_end).then(|| {
+                fade.with_range((overlap_start - start)..(overlap_end - start))
+            })
+        })
+        .collect();
+    if let Ok(mut state) = state.lock() {
+        state.fades = local_fades;
     }
 }
 
@@ -702,9 +827,14 @@ fn table_selected_source(table: &Table) -> String {
 /// and sub-list lines align under the item text. Items with no selected content
 /// are skipped but still consume an ordered number, so the remaining items keep
 /// their original numbering.
-fn list_selected_source(children: &[BlockNode], ordered: bool, indent: &str) -> String {
+fn list_selected_source(
+    children: &[BlockNode],
+    ordered: bool,
+    start_item_ix: usize,
+    indent: &str,
+) -> String {
     let mut out = String::new();
-    let mut item_ix = 0usize;
+    let mut item_ix = start_item_ix;
 
     for child in children {
         let BlockNode::ListItem {
@@ -736,12 +866,14 @@ fn list_selected_source(children: &[BlockNode], ordered: bool, indent: &str) -> 
             if let BlockNode::List {
                 children: sub_children,
                 ordered: sub_ordered,
+                start: sub_start,
                 ..
             } = sub
             {
                 nested.push_str(&list_selected_source(
                     sub_children,
                     *sub_ordered,
+                    *sub_start,
                     &child_indent,
                 ));
             } else {
@@ -926,6 +1058,34 @@ impl Paragraph {
             text.push_str(&node.text);
         }
         text
+    }
+
+    fn apply_text_fades(&self, fades: &[TextFade], cursor: &mut usize) {
+        if let Ok(mut state) = self.state.lock() {
+            state.fades.clear();
+        }
+        for child in &self.children {
+            if let Ok(mut state) = child.state.lock() {
+                state.fades.clear();
+            }
+        }
+
+        let mut run_len = 0;
+        for child in &self.children {
+            if child.image.is_some() {
+                if run_len > 0 {
+                    set_state_fades(&child.state, *cursor, run_len, fades);
+                    *cursor += run_len;
+                    run_len = 0;
+                }
+            } else {
+                run_len += child.text.len();
+            }
+        }
+        if run_len > 0 {
+            set_state_fades(&self.state, *cursor, run_len, fades);
+            *cursor += run_len;
+        }
     }
 
     /// Synchronously clear the selection stored in every inline state.
@@ -1658,13 +1818,16 @@ impl BlockNode {
                     .join("\n")
             }
             BlockNode::List {
-                children, ordered, ..
+                children,
+                ordered,
+                start,
+                ..
             } => children
                 .iter()
                 .enumerate()
                 .map(|(i, child)| {
                     let prefix = if *ordered {
-                        format!("{}. ", i + 1)
+                        format!("{}. ", start + i + 1)
                     } else {
                         "- ".to_string()
                     };
@@ -1672,6 +1835,19 @@ impl BlockNode {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
+            BlockNode::VirtualListItem {
+                child,
+                ordered,
+                item_ix,
+                ..
+            } => {
+                let prefix = if *ordered {
+                    format!("{}. ", item_ix + 1)
+                } else {
+                    "- ".to_string()
+                };
+                format!("{}{}", prefix, child.to_markdown())
+            }
             BlockNode::ListItem {
                 children, checked, ..
             } => {
@@ -1884,6 +2060,7 @@ impl BlockNode {
                             BlockNode::Root { .. }
                             | BlockNode::Heading { .. }
                             | BlockNode::Blockquote { .. }
+                            | BlockNode::VirtualListItem { .. }
                             | BlockNode::CodeBlock(_)
                             | BlockNode::Custom(_)
                             | BlockNode::Table(_)
@@ -2300,7 +2477,10 @@ impl BlockNode {
                 )
                 .into_any_element(),
             BlockNode::List {
-                children, ordered, ..
+                children,
+                ordered,
+                start,
+                ..
             } => v_flex()
                 .id((if *ordered { "ol" } else { "ul" }, ix))
                 .w_full()
@@ -2308,7 +2488,7 @@ impl BlockNode {
                 .pb(mb)
                 .children({
                     let mut items = Vec::with_capacity(children.len());
-                    let mut item_index = 0;
+                    let mut item_index = *start;
                     for (ix, item) in children.into_iter().enumerate() {
                         let is_item = item.is_list_item();
 
@@ -2331,6 +2511,30 @@ impl BlockNode {
                     }
                     items
                 })
+                .into_any_element(),
+            BlockNode::VirtualListItem {
+                child,
+                ordered,
+                item_ix,
+                is_last,
+                ..
+            } => v_flex()
+                .id(("virtual-list-item", ix))
+                .w_full()
+                .min_w_0()
+                .pb(if *is_last { mb } else { rems(0.) })
+                .child(Self::render_list_item(
+                    child,
+                    *item_ix,
+                    NodeRenderOptions {
+                        ordered: *ordered,
+                        is_last: true,
+                        ..options
+                    },
+                    node_cx,
+                    window,
+                    cx,
+                ))
                 .into_any_element(),
             BlockNode::CodeBlock(code_block) => code_block.render(&options, node_cx, window, cx),
             BlockNode::Custom(node) => {
@@ -2498,6 +2702,7 @@ mod tests {
     fn unordered_list_selected_source_prefixes_dash() {
         let list = BlockNode::List {
             ordered: false,
+            start: 0,
             span: None,
             children: vec![
                 BlockNode::ListItem {
@@ -2524,6 +2729,7 @@ mod tests {
     fn ordered_list_selected_source_prefixes_numbers() {
         let list = BlockNode::List {
             ordered: true,
+            start: 0,
             span: None,
             children: vec![
                 BlockNode::ListItem {
@@ -2553,6 +2759,7 @@ mod tests {
         // - two
         let nested = BlockNode::List {
             ordered: false,
+            start: 0,
             span: None,
             children: vec![BlockNode::ListItem {
                 children: vec![BlockNode::Paragraph(selected_paragraph("nested"))],
@@ -2563,6 +2770,7 @@ mod tests {
         };
         let list = BlockNode::List {
             ordered: false,
+            start: 0,
             span: None,
             children: vec![
                 BlockNode::ListItem {
@@ -2589,6 +2797,7 @@ mod tests {
     fn task_list_selected_source_restores_checkboxes() {
         let list = BlockNode::List {
             ordered: false,
+            start: 0,
             span: None,
             children: vec![
                 BlockNode::ListItem {
@@ -2709,6 +2918,7 @@ mod tests {
                 BlockNode::Paragraph(selected_paragraph("start")),
                 BlockNode::List {
                     ordered: true,
+                    start: 2,
                     children: vec![],
                     span: Some(Span {
                         start: list_start,
@@ -2848,6 +3058,7 @@ mod tests {
                 selected_code_block("let x = 1;\n", Some("rust")),
                 BlockNode::List {
                     ordered: true,
+                    start: 0,
                     span: None,
                     children: vec![
                         BlockNode::ListItem {

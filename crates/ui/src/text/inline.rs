@@ -2,7 +2,8 @@ use gpui::Corners;
 use std::{
     ops::Range,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -32,17 +33,68 @@ pub(super) struct Inline {
     highlights: Vec<(Range<usize>, HighlightStyle)>,
     styled_text: StyledText,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    fades: Vec<TextFade>,
+    animating: bool,
 
     state: Arc<Mutex<InlineState>>,
 }
 
 /// The inline text state, used RefCell to keep the selection state.
+#[derive(Clone, Debug)]
+pub(crate) struct TextFade {
+    pub(crate) range: Range<usize>,
+    started_at: Arc<OnceLock<Instant>>,
+    duration: Duration,
+}
+
+impl TextFade {
+    pub(crate) fn new(range: Range<usize>, duration: Duration) -> Self {
+        Self {
+            range,
+            started_at: Arc::default(),
+            duration,
+        }
+    }
+
+    pub(crate) fn with_range(&self, range: Range<usize>) -> Self {
+        Self {
+            range,
+            started_at: self.started_at.clone(),
+            duration: self.duration,
+        }
+    }
+
+    pub(crate) fn opacity_at(&self, now: Instant) -> f32 {
+        if self.duration.is_zero() {
+            return 1.;
+        }
+        let started_at = *self.started_at.get_or_init(|| now);
+        (now.saturating_duration_since(started_at).as_secs_f32() / self.duration.as_secs_f32())
+            .clamp(0., 1.)
+    }
+
+    pub(crate) fn is_complete_at(&self, now: Instant) -> bool {
+        self.started_at
+            .get()
+            .is_some_and(|started_at| now.saturating_duration_since(*started_at) >= self.duration)
+    }
+}
+
+impl PartialEq for TextFade {
+    fn eq(&self, other: &Self) -> bool {
+        self.range == other.range
+            && self.duration == other.duration
+            && self.started_at.get() == other.started_at.get()
+    }
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct InlineState {
     hovered_index: Option<usize>,
     /// The text that actually rendering, matched with selection.
     pub(super) text: SharedString,
     pub(super) selection: Option<Selection>,
+    pub(crate) fades: Vec<TextFade>,
 }
 
 impl InlineState {
@@ -60,9 +112,9 @@ impl Inline {
         highlights: Vec<(Range<usize>, HighlightStyle)>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     ) -> Self {
-        let text = state
+        let (text, fades) = state
             .lock()
-            .map(|state| state.text.clone())
+            .map(|state| (state.text.clone(), state.fades.clone()))
             .unwrap_or_default();
 
         Self {
@@ -72,6 +124,8 @@ impl Inline {
             text: text.clone(),
             styled_text: StyledText::new(text),
             link_click_handler,
+            fades,
+            animating: false,
             state,
         }
     }
@@ -209,45 +263,27 @@ impl Inline {
         mask_bounds: Bounds<Pixels>,
     ) -> Vec<Bounds<Pixels>> {
         let mut line_bounds = Vec::new();
-        let mut current_line_y = None;
-        let mut current_bounds: Option<Bounds<Pixels>> = None;
-        let mut offset = 0;
+        let mut origin = text_layout.bounds().origin;
 
-        for c in self.text.chars() {
-            let next_offset = offset + c.len_utf8();
-            let Some(pos) = text_layout.position_for_index(offset) else {
-                offset = next_offset;
-                continue;
-            };
+        // `position_for_index` scans hard lines from the beginning. Calling it
+        // for every character therefore turns a large code block into O(n²)
+        // work on every scroll frame. GPUI already exposes the shaped hard-line
+        // layouts, so build the selection hit geometry directly in O(lines).
+        for line in text_layout.line_layouts() {
+            let size = line.size(line_height);
+            let bottom = origin.y + size.height;
 
-            let mut char_width = line_height.half();
-            if let Some(next_pos) = text_layout.position_for_index(next_offset) {
-                if next_pos.y == pos.y {
-                    char_width = next_pos.x - pos.x;
+            if bottom > mask_bounds.top() && origin.y < mask_bounds.bottom() {
+                let bounds = Bounds { origin, size }.intersect(&mask_bounds);
+                if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
+                    line_bounds.push(bounds);
                 }
             }
 
-            let bounds = Bounds::from_corners(pos, point(pos.x + char_width, pos.y + line_height))
-                .intersect(&mask_bounds);
-            if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
-                if current_line_y == Some(pos.y) {
-                    if let Some(current) = current_bounds.as_mut() {
-                        *current = current.union(&bounds);
-                    }
-                } else {
-                    if let Some(current) = current_bounds.take() {
-                        line_bounds.push(current);
-                    }
-                    current_line_y = Some(pos.y);
-                    current_bounds = Some(bounds);
-                }
+            origin.y = bottom;
+            if origin.y >= mask_bounds.bottom() {
+                break;
             }
-
-            offset = next_offset;
-        }
-
-        if let Some(current) = current_bounds {
-            line_bounds.push(current);
         }
 
         line_bounds
@@ -328,6 +364,42 @@ impl Inline {
     }
 }
 
+fn animated_highlights(
+    text_len: usize,
+    highlights: &[(Range<usize>, HighlightStyle)],
+    fades: &[TextFade],
+    now: Instant,
+) -> (Vec<(Range<usize>, HighlightStyle)>, bool) {
+    let mut animating = false;
+    let fade_highlights = fades
+        .iter()
+        .filter_map(|fade| {
+            let range = fade.range.start.min(text_len)..fade.range.end.min(text_len);
+            if range.is_empty() {
+                return None;
+            }
+            let opacity = fade.opacity_at(now);
+            animating |= opacity < 1.;
+            Some((
+                range,
+                HighlightStyle {
+                    fade_out: Some(1. - opacity),
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if fade_highlights.is_empty() {
+        return (highlights.to_vec(), false);
+    }
+
+    (
+        gpui::combine_highlights(highlights.to_vec(), fade_highlights).collect(),
+        animating,
+    )
+}
+
 impl IntoElement for Inline {
     type Element = Self;
 
@@ -356,14 +428,23 @@ impl Element for Inline {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let text_style = window.text_style();
+        let now = Instant::now();
+        let fades = if cx.reduce_motion() {
+            &[][..]
+        } else {
+            self.fades.as_slice()
+        };
+        let (highlights, animating) =
+            animated_highlights(self.text.len(), &self.highlights, fades, now);
+        self.animating = animating;
 
         let mut runs = Vec::new();
         let mut ix = 0;
-        for (range, highlight) in self.highlights.iter() {
+        for (range, highlight) in highlights {
             if ix < range.start {
                 runs.push(text_style.clone().to_run(range.start - ix));
             }
-            runs.push(text_style.clone().highlight(*highlight).to_run(range.len()));
+            runs.push(text_style.clone().highlight(highlight).to_run(range.len()));
             ix = range.end;
         }
         if ix < self.text.len() {
@@ -413,6 +494,9 @@ impl Element for Inline {
         let text_layout = self.styled_text.layout().clone();
         self.styled_text
             .paint(global_id, None, bounds, &mut (), &mut (), window, cx);
+        if self.animating && !cx.reduce_motion() {
+            window.request_animation_frame();
+        }
 
         // layout selections
         let (is_selectable, is_selection, selection) =
@@ -441,9 +525,10 @@ impl Element for Inline {
                     text_layout.line_height(),
                     window.content_mask().bounds,
                 );
-                text_view_state.update(cx, |state, _| {
-                    state.selection_adapter.register_inline(text_bounds);
-                });
+                text_view_state
+                    .read(cx)
+                    .selection_adapter
+                    .register_inline(text_bounds);
             }
 
             window.on_mouse_event({

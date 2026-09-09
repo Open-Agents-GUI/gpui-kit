@@ -1,10 +1,16 @@
 use futures::Stream as _;
-use std::{ops::RangeInclusive, pin::Pin, sync::Arc, task::Poll};
+use std::{
+    ops::{Range, RangeInclusive},
+    pin::Pin,
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, FocusHandle, IntoElement, KeyBinding, ListState,
-    ParentElement as _, Pixels, Point, Render, SharedString, Styled as _, Task, Window,
-    prelude::FluentBuilder as _, px,
+    App, AppContext as _, Bounds, Context, DefiniteLength, FocusHandle, FollowMode, IntoElement,
+    KeyBinding, ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
+    Task, Window, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -16,6 +22,7 @@ use crate::{
         CodeBlockActionsFn, LinkClickHandlerFn, MarkdownExtensions, TextViewStyle,
         document::ParsedDocument,
         format,
+        inline::TextFade,
         node::{self, NodeContext},
         selection_adapter::TextViewSelectionAdapter,
     },
@@ -78,6 +85,8 @@ pub struct TextViewState {
     pub(super) selectable: bool,
     pub(super) selection_format: SelectionFormat,
     pub(super) scrollable: bool,
+    pub(super) content_max_width: Option<DefiniteLength>,
+    pub(super) scroll_bottom_padding: Option<DefiniteLength>,
     pub(super) text_view_style: TextViewStyle,
     pub(super) code_block_actions: Option<std::sync::Arc<CodeBlockActionsFn>>,
     pub(super) link_click_handler: Option<std::sync::Arc<LinkClickHandlerFn>>,
@@ -98,6 +107,8 @@ pub struct TextViewState {
     revision: usize,
     pub(super) selection_revision: usize,
     compatible_layout_update: bool,
+    append_fade_duration: Option<Duration>,
+    append_fades: Vec<Vec<TextFade>>,
     parsed_error: Option<SharedString>,
     tx: Sender<UpdateOptions>,
     _parse_task: Task<()>,
@@ -136,6 +147,32 @@ impl TextViewState {
 
                         match parsed_update.result {
                             Ok(content) => {
+                                if parsed_update.selection_compatible {
+                                    let previous_document = state.parsed_content.document.clone();
+                                    state.update_append_fades(
+                                        &previous_document,
+                                        &content.document,
+                                        parsed_update.preserved_block_count.unwrap_or(0),
+                                        Instant::now(),
+                                        cx.reduce_motion(),
+                                    );
+                                } else {
+                                    state.append_fades.clear();
+                                }
+                                content
+                                    .document
+                                    .apply_text_fades_by_block(&state.append_fades);
+
+                                if let Some(layout_splice) = parsed_update.layout_splice {
+                                    state.splice_layout(layout_splice);
+                                } else if let Some(preserved_block_count) =
+                                    parsed_update.preserved_block_count
+                                {
+                                    state.splice_compatible_layout(
+                                        preserved_block_count,
+                                        content.document.blocks.len(),
+                                    );
+                                }
                                 state.parsed_content = content;
                                 state.parsed_error = None;
                                 state.compatible_layout_update = parsed_update.selection_compatible;
@@ -167,6 +204,8 @@ impl TextViewState {
             selectable: false,
             selection_format: SelectionFormat::default(),
             scrollable: false,
+            content_max_width: None,
+            scroll_bottom_padding: None,
             // Measure all blocks (not just visible ones) so the scrollbar
             // thumb size stays stable. Without this, off-screen blocks count
             // as zero height until scrolled into view, which makes the
@@ -186,11 +225,13 @@ impl TextViewState {
             revision: 0,
             selection_revision: 0,
             compatible_layout_update: false,
+            append_fade_duration: None,
+            append_fades: Vec::new(),
             tx,
             _parse_task,
             _receive_task,
         };
-        this.increment_update(&text, false, cx);
+        this.increment_update(&text, false, false, cx);
         this
     }
 
@@ -242,16 +283,96 @@ impl TextViewState {
         cx.notify();
     }
 
+    /// Set how a scrollable text view follows content added at its end.
+    pub fn set_follow_mode(&mut self, mode: FollowMode, cx: &mut Context<Self>) {
+        self.list_state.set_follow_mode(mode);
+        cx.notify();
+    }
+
+    /// Invalidate cached block measurements while preserving the logical viewport.
+    ///
+    /// Call this after changing data rendered by a Markdown plugin without changing
+    /// the Markdown source itself.
+    pub fn remeasure_content(&mut self, cx: &mut Context<Self>) {
+        self.list_state
+            .remeasure_items(0..self.list_state.item_count());
+        cx.notify();
+    }
+
+    /// Invalidate one top-level custom Markdown block while preserving the logical viewport.
+    ///
+    /// Returns whether a matching parsed block was found. The predicate can inspect
+    /// the typed data stored in [`crate::text::MarkdownNode`].
+    pub fn remeasure_custom_block(
+        &mut self,
+        mut predicate: impl FnMut(&crate::text::MarkdownNode) -> bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ix) = self
+            .parsed_content
+            .document
+            .blocks
+            .iter()
+            .position(|block| match block {
+                node::BlockNode::Custom(node) => predicate(node),
+                _ => false,
+            })
+        else {
+            return false;
+        };
+
+        self.list_state.remeasure_items(ix..ix + 1);
+        cx.notify();
+        true
+    }
+
+    /// Fade text introduced by append updates from transparent to opaque.
+    ///
+    /// This is paint-only: it does not change parsing, wrapping, selection, or
+    /// cached block measurements. Pass `None` to disable the effect.
+    pub fn set_append_fade_duration(&mut self, duration: Option<Duration>, cx: &mut Context<Self>) {
+        if self.append_fade_duration == duration {
+            return;
+        }
+        self.append_fade_duration = duration;
+        if duration.is_none() {
+            self.append_fades.clear();
+            self.parsed_content.document.apply_text_fades_by_block(&[]);
+        }
+        cx.notify();
+    }
+
     /// Set the text content.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.set_text_inner(text, false, cx);
+    }
+
+    /// Replace the text while preserving unchanged top-level blocks and the
+    /// logical viewport around the replaced block range.
+    ///
+    /// Use this for structural edits within the same document. Unlike
+    /// [`Self::set_text`], this updates the backing [`ListState`] with a splice
+    /// after parsing instead of allowing the renderer to reset the whole list.
+    pub fn set_text_preserving_layout(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.set_text_inner(text, true, cx);
+    }
+
+    fn set_text_inner(
+        &mut self,
+        text: &str,
+        preserve_layout: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.text.as_str() == text {
             return;
         }
 
         self.text.clear();
         self.text.push_str(text);
+        self.append_fades.clear();
+        self.parsed_content.document.apply_text_fades_by_block(&[]);
         self.parsed_error = None;
-        self.increment_update(text, false, cx);
+        self.increment_update(text, false, preserve_layout, cx);
     }
 
     /// Append partial text content to the existing text.
@@ -260,7 +381,7 @@ impl TextViewState {
             return;
         }
         self.text.push_str(new_text);
-        self.increment_update(new_text, true, cx);
+        self.increment_update(new_text, true, false, cx);
     }
 
     pub(crate) fn set_markdown_extensions(
@@ -275,7 +396,7 @@ impl TextViewState {
         self.markdown_extensions = markdown_extensions;
         if self.format == TextViewFormat::Markdown {
             let text = self.text.clone();
-            self.increment_update(&text, false, cx);
+            self.increment_update(&text, false, false, cx);
         }
     }
 
@@ -330,12 +451,20 @@ impl TextViewState {
         self.parsed_content.document.selected_text(format, blocks)
     }
 
-    fn increment_update(&mut self, text: &str, append: bool, cx: &mut Context<Self>) {
+    fn increment_update(
+        &mut self,
+        text: &str,
+        append: bool,
+        preserve_layout: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.revision += 1;
         if !append {
             self.selection_revision = self.selection_revision.wrapping_add(1);
         }
         let parse_synchronously = !append && text.len() <= MAX_SYNC_FULL_REPLACE_BYTES;
+        let previous_document =
+            (preserve_layout || append).then(|| self.parsed_content.document.clone());
         let update_options = UpdateOptions {
             revision: self.revision,
             append,
@@ -348,6 +477,8 @@ impl TextViewState {
             },
             pending_text: text.to_string(),
             markdown_extensions: self.markdown_extensions.clone(),
+            preserve_layout,
+            previous_document,
         };
 
         // Keep small full replacements synchronous so their first layout has
@@ -356,6 +487,15 @@ impl TextViewState {
         if parse_synchronously {
             match parse_content(self.format, ParsedContent::default(), &update_options) {
                 Ok(content) => {
+                    if preserve_layout {
+                        self.splice_layout(replacement_layout_splice(
+                            update_options
+                                .previous_document
+                                .as_ref()
+                                .expect("preserving replacement has a previous document"),
+                            &content.document,
+                        ));
+                    }
                     self.parsed_content = content;
                     self.parsed_error = None;
                     if !self.is_selecting {
@@ -375,6 +515,89 @@ impl TextViewState {
         }
 
         _ = self.tx.try_send(update_options);
+    }
+
+    /// Preserve measured list rows before the Markdown fragment reparsed by an
+    /// append. Replacing the whole `ListState` here used to make `measure_all`
+    /// lay out every custom block again whenever an append added a top-level
+    /// block, which is especially expensive for transcript plugins.
+    fn update_append_fades(
+        &mut self,
+        previous: &ParsedDocument,
+        next: &ParsedDocument,
+        preserved_block_count: usize,
+        now: Instant,
+        reduce_motion: bool,
+    ) {
+        let Some(duration) = self.append_fade_duration else {
+            self.append_fades.clear();
+            return;
+        };
+        if duration.is_zero() || reduce_motion {
+            self.append_fades.clear();
+            return;
+        }
+
+        let mut next_fades = vec![Vec::new(); next.blocks.len()];
+        let preserved_block_count = preserved_block_count.min(next.blocks.len());
+
+        // For unchanged blocks, carry over their animations which are still valid.
+        for (ix, block) in next.blocks.iter().take(preserved_block_count).enumerate() {
+            let visible_end = block.text().trim_end_matches('\n').len();
+            inherit_active_fades(
+                &mut next_fades[ix],
+                self.append_fades.get(ix).map(Vec::as_slice),
+                visible_end,
+                now,
+            );
+        }
+
+        // The reparsed suffix can contain several old or newly created blocks.
+        // Preserve each block's stable rendered prefix, then animate its new suffix.
+        for (ix, next_block) in next.blocks.iter().enumerate().skip(preserved_block_count) {
+            let next_text = next_block.text();
+            let visible_end = next_text.trim_end_matches('\n').len();
+            let stable_prefix = previous
+                .blocks
+                .get(ix)
+                .map(|previous_block| common_prefix_len(&previous_block.text(), &next_text))
+                .unwrap_or(0)
+                .min(visible_end);
+
+            inherit_active_fades(
+                &mut next_fades[ix],
+                self.append_fades.get(ix).map(Vec::as_slice),
+                stable_prefix,
+                now,
+            );
+
+            if stable_prefix < visible_end {
+                next_fades[ix].push(TextFade::new(stable_prefix..visible_end, duration));
+            }
+        }
+
+        self.append_fades = next_fades;
+    }
+
+    fn splice_compatible_layout(&mut self, preserved_block_count: usize, new_len: usize) {
+        let old_len = self.list_state.item_count();
+        let preserved_block_count = preserved_block_count.min(old_len).min(new_len);
+        self.list_state.splice(
+            preserved_block_count..old_len,
+            new_len - preserved_block_count,
+        );
+        // `splice` keeps the prefix's measured sizes and marks only the new
+        // suffix unmeasured. Re-arm `measure_all` so it fills that suffix and
+        // retains an exact, stable scrollbar height.
+        self.list_state.clone().measure_all();
+    }
+
+    fn splice_layout(&mut self, splice: LayoutSplice) {
+        let old_len = self.list_state.item_count();
+        let start = splice.old_range.start.min(old_len);
+        let end = splice.old_range.end.min(old_len).max(start);
+        self.list_state.splice(start..end, splice.new_count);
+        self.list_state.clone().measure_all();
     }
 
     /// Save bounds and unselect if bounds changed.
@@ -570,6 +793,8 @@ impl Render for TextViewState {
                     } else {
                         None
                     },
+                    self.content_max_width,
+                    self.scroll_bottom_padding,
                     &node_cx,
                     window,
                     cx,
@@ -616,6 +841,40 @@ impl Render for TextViewState {
     }
 }
 
+fn inherit_active_fades(
+    target: &mut Vec<TextFade>,
+    existing: Option<&[TextFade]>,
+    stable_prefix: usize,
+    now: Instant,
+) {
+    let Some(existing) = existing else {
+        return;
+    };
+
+    target.extend(existing.iter().filter_map(|fade| {
+        let end = fade.range.end.min(stable_prefix);
+
+        if fade.range.start < end && !fade.is_complete_at(now) {
+            Some(fade.with_range(fade.range.start..end))
+        }else {
+            None
+        }
+    }));
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    let mut len = left
+        .as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !right.is_char_boundary(len) {
+        len -= 1;
+    }
+    len
+}
+
 #[derive(Clone, PartialEq, Default)]
 pub(crate) struct ParsedContent {
     pub(crate) document: ParsedDocument,
@@ -654,7 +913,22 @@ impl Future for UpdateFuture {
                     let hit_coalesce_budget =
                         merge_pending_options(&mut options, self.rx.as_ref().get_ref());
 
+                    let preserved_block_count = options.append.then(|| {
+                        append_reparse_range(&self.content.document)
+                            .map_or(0, |(_, preserved_block_count)| preserved_block_count)
+                    });
                     let res = parse_content(self.format, self.content.clone(), &options);
+                    let layout_splice = options.preserve_layout.then(|| {
+                        res.as_ref().ok().map(|content| {
+                            replacement_layout_splice(
+                                options
+                                    .previous_document
+                                    .as_ref()
+                                    .expect("preserving replacement has a previous document"),
+                                &content.document,
+                            )
+                        })
+                    });
                     if let Ok(content) = &res {
                         self.content = content.clone();
                     }
@@ -662,6 +936,8 @@ impl Future for UpdateFuture {
                         revision: options.revision,
                         full_parse: !options.append,
                         selection_compatible: options.mode == ParseMode::Compatible,
+                        preserved_block_count,
+                        layout_splice: layout_splice.flatten(),
                         baseline_ack: options.mode == ParseMode::BaselineAck,
                         result: res,
                     });
@@ -685,6 +961,8 @@ struct UpdateOptions {
     append: bool,
     mode: ParseMode,
     markdown_extensions: Arc<MarkdownExtensions>,
+    preserve_layout: bool,
+    previous_document: Option<ParsedDocument>,
 }
 
 impl UpdateOptions {
@@ -692,6 +970,13 @@ impl UpdateOptions {
         if next.append {
             self.pending_text.push_str(&next.pending_text);
             self.revision = next.revision;
+            if self.preserve_layout {
+                // A synchronous preserving replacement may already have
+                // applied its splice on the UI thread. Compare the coalesced
+                // append against that current document, not the document from
+                // before the replacement, so the splice is not applied twice.
+                self.previous_document = next.previous_document;
+            }
             if self.mode != ParseMode::Replace {
                 self.mode = ParseMode::Compatible;
             }
@@ -705,6 +990,8 @@ struct ParsedUpdate {
     revision: usize,
     full_parse: bool,
     selection_compatible: bool,
+    preserved_block_count: Option<usize>,
+    layout_splice: Option<LayoutSplice>,
     baseline_ack: bool,
     result: Result<ParsedContent, SharedString>,
 }
@@ -714,6 +1001,12 @@ enum ParseMode {
     BaselineAck,
     Replace,
     Compatible,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayoutSplice {
+    old_range: Range<usize>,
+    new_count: usize,
 }
 
 fn merge_pending_options(options: &mut UpdateOptions, rx: &Receiver<UpdateOptions>) -> bool {
@@ -743,12 +1036,18 @@ fn parse_content(
     };
 
     let mut source = String::new();
-    if options.append
-        && let Some(last_block) = content.document.blocks.pop()
-        && let Some(span) = last_block.span()
-    {
-        node_cx.offset = span.start;
-        let last_source = &content.document.source[span.start..];
+    let reparse_start = if options.append {
+        append_reparse_range(&content.document).map(|(start, preserved_block_count)| {
+            Arc::make_mut(&mut content.document.blocks).truncate(preserved_block_count);
+            start
+        })
+    } else {
+        None
+    };
+
+    if let Some(start) = reparse_start {
+        node_cx.offset = start;
+        let last_source = &content.document.source[start..];
         source.push_str(last_source);
         source.push_str(&options.pending_text);
     } else {
@@ -763,7 +1062,8 @@ fn parse_content(
     if options.append {
         content.document.source =
             format!("{}{}", content.document.source, options.pending_text).into();
-        content.document.blocks.extend(new_document.blocks);
+        Arc::make_mut(&mut content.document.blocks)
+            .extend(Arc::unwrap_or_clone(new_document.blocks));
     } else {
         content.document = new_document;
     }
@@ -771,11 +1071,213 @@ fn parse_content(
     Ok(content)
 }
 
+/// Return the source offset reparsed by an append and the number of document
+/// blocks that remain byte-for-byte compatible before it.
+fn append_reparse_range(document: &ParsedDocument) -> Option<(usize, usize)> {
+    let last_block = document.blocks.last()?;
+    let start = last_block.reparse_start()?;
+    let mut preserved_block_count = document.blocks.len() - 1;
+
+    // A virtualized list is represented by multiple document blocks, but
+    // append parsing must restart at the original list prefix so numbering and
+    // Markdown continuation remain correct.
+    while preserved_block_count > 0
+        && document.blocks[preserved_block_count - 1]
+            .span()
+            .is_some_and(|span| span.start >= start)
+    {
+        preserved_block_count -= 1;
+    }
+
+    Some((start, preserved_block_count))
+}
+
+/// Find the smallest top-level block range that represents a full-document
+/// replacement. Blocks outside the range have identical source and can retain
+/// their cached measurements.
+fn replacement_layout_splice(
+    previous: &ParsedDocument,
+    replacement: &ParsedDocument,
+) -> LayoutSplice {
+    let previous_len = previous.blocks.len();
+    let replacement_len = replacement.blocks.len();
+    let shared_len = previous_len.min(replacement_len);
+
+    let prefix_len = (0..shared_len)
+        .take_while(|&ix| blocks_have_same_layout(previous, ix, replacement, ix, false))
+        .count();
+
+    let suffix_limit = (previous_len - prefix_len).min(replacement_len - prefix_len);
+    let suffix_len = (0..suffix_limit)
+        .take_while(|&offset| {
+            blocks_have_same_layout(
+                previous,
+                previous_len - offset - 1,
+                replacement,
+                replacement_len - offset - 1,
+                true,
+            )
+        })
+        .count();
+
+    LayoutSplice {
+        old_range: prefix_len..previous_len - suffix_len,
+        new_count: replacement_len - prefix_len - suffix_len,
+    }
+}
+
+fn blocks_have_same_layout(
+    left_document: &ParsedDocument,
+    left_ix: usize,
+    right_document: &ParsedDocument,
+    right_ix: usize,
+    shifted: bool,
+) -> bool {
+    let left = &left_document.blocks[left_ix];
+    let right = &right_document.blocks[right_ix];
+    if std::mem::discriminant(left) != std::mem::discriminant(right) {
+        return false;
+    }
+
+    // A virtual list item's presentation includes its position in the list.
+    // If preceding items changed, matching source alone does not make its
+    // cached layout reusable.
+    if shifted && matches!(left, node::BlockNode::VirtualListItem { .. }) {
+        return false;
+    }
+
+    let Some(left_span) = left.span() else {
+        return false;
+    };
+    let Some(right_span) = right.span() else {
+        return false;
+    };
+    left_document.source.get(left_span.start..left_span.end)
+        == right_document
+            .source
+            .get(right_span.start..right_span.end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::text::MarkdownNode;
-    use gpui::TestAppContext;
+    use gpui::{ListOffset, TestAppContext};
+
+    #[test]
+    fn replacement_layout_splice_preserves_unchanged_prefix_and_suffix() {
+        let parse = |source: &str| {
+            parse_content(
+                TextViewFormat::Markdown,
+                ParsedContent::default(),
+                &UpdateOptions {
+                    revision: 1,
+                    pending_text: source.into(),
+                    append: false,
+                    mode: ParseMode::Replace,
+                    markdown_extensions: Arc::default(),
+                    preserve_layout: false,
+                    previous_document: None,
+                },
+            )
+            .expect("parse markdown")
+            .document
+        };
+        let previous = parse("one\n\ntwo\n\nthree\n\nfour");
+        let replacement = parse("one\n\ntwo\n\ninserted\n\nthree\n\nfour");
+
+        assert_eq!(
+            replacement_layout_splice(&previous, &replacement),
+            LayoutSplice {
+                old_range: 2..2,
+                new_count: 1,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn preserving_replacement_keeps_viewport_anchored_in_unchanged_suffix(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let previous = "one\n\ntwo\n\nthree\n\nfour";
+        let replacement = "one\n\ntwo\n\ninserted\n\nthree\n\nfour";
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown(previous, cx)));
+
+        state.update(cx, |state, cx| {
+            state.list_state.reset(4);
+            state.list_state.scroll_to(ListOffset {
+                item_ix: 3,
+                offset_in_item: px(7.),
+            });
+            state.set_text_preserving_layout(replacement, cx);
+
+            assert_eq!(state.list_state.item_count(), 5);
+            let scroll_top = state.list_state.logical_scroll_top();
+            assert_eq!(scroll_top.item_ix, 4);
+            assert_eq!(scroll_top.offset_in_item, px(7.));
+        });
+    }
+
+    #[test]
+    fn append_reparses_a_virtualized_list_from_its_original_start() {
+        let initial = UpdateOptions {
+            revision: 1,
+            pending_text: "- one\n- two\n- three\n".into(),
+            append: false,
+            mode: ParseMode::Replace,
+            markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
+        };
+        let content = parse_content(TextViewFormat::Markdown, ParsedContent::default(), &initial)
+            .expect("initial list parse");
+        assert_eq!(content.document.blocks.len(), 3);
+
+        let append = UpdateOptions {
+            revision: 2,
+            pending_text: "- four\n".into(),
+            append: true,
+            mode: ParseMode::Compatible,
+            markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
+        };
+        let content =
+            parse_content(TextViewFormat::Markdown, content, &append).expect("appended list parse");
+
+        assert_eq!(
+            content.document.source.as_ref(),
+            "- one\n- two\n- three\n- four\n"
+        );
+        assert_eq!(content.document.blocks.len(), 4);
+        for (expected_ix, block) in content.document.blocks.iter().enumerate() {
+            let node::BlockNode::VirtualListItem { item_ix, .. } = block else {
+                panic!("expected independently virtualized list item");
+            };
+            assert_eq!(*item_ix, expected_ix);
+        }
+    }
+
+    #[test]
+    fn append_reports_the_unchanged_block_prefix() {
+        let initial = UpdateOptions {
+            revision: 1,
+            pending_text: "first paragraph\n\nsecond paragraph".into(),
+            append: false,
+            mode: ParseMode::Replace,
+            markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
+        };
+        let content = parse_content(TextViewFormat::Markdown, ParsedContent::default(), &initial)
+            .expect("initial parse");
+
+        let (start, preserved_block_count) =
+            append_reparse_range(&content.document).expect("append range");
+        assert_eq!(preserved_block_count, 1);
+        assert_eq!(start, "first paragraph\n\n".len());
+    }
 
     #[gpui::test]
     fn small_full_replace_parses_before_background_executor_runs(cx: &mut TestAppContext) {
@@ -905,6 +1407,8 @@ mod tests {
             append: true,
             mode: ParseMode::Compatible,
             markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
         };
 
         options.merge(UpdateOptions {
@@ -913,6 +1417,8 @@ mod tests {
             append: false,
             mode: ParseMode::BaselineAck,
             markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
         });
         options.merge(UpdateOptions {
             revision: 3,
@@ -920,6 +1426,8 @@ mod tests {
             append: true,
             mode: ParseMode::Compatible,
             markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
         });
 
         assert_eq!(options.revision, 3);
@@ -935,6 +1443,8 @@ mod tests {
             append: false,
             mode: ParseMode::Replace,
             markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
         };
 
         options.merge(UpdateOptions {
@@ -943,6 +1453,8 @@ mod tests {
             append: true,
             mode: ParseMode::Compatible,
             markdown_extensions: Arc::default(),
+            preserve_layout: false,
+            previous_document: None,
         });
 
         assert_eq!(options.revision, 2);
@@ -968,6 +1480,8 @@ mod tests {
                     ParseMode::Compatible
                 },
                 markdown_extensions: Arc::default(),
+                preserve_layout: false,
+                previous_document: None,
             })
             .unwrap();
         }
