@@ -3,8 +3,8 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc, time::Duration
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, GlobalElementId,
     InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, ParentElement, Pixels,
-    RenderOnce, SharedString, StatefulInteractiveElement as _, Style, StyleRefinement, Styled,
-    Window, div, percentage, prelude::FluentBuilder as _, px, relative, rems, size,
+    RenderOnce, SharedString, Style, StyleRefinement, Styled, Window, div, percentage,
+    prelude::FluentBuilder as _, px, relative, rems, size,
 };
 
 use crate::{
@@ -106,6 +106,10 @@ impl RenderOnce for Accordion {
         let open_indices = Rc::new(RefCell::new(HashSet::new()));
         let multiple = self.multiple;
         let last_ix = self.children.len().saturating_sub(1);
+        // The app's toggle callback belongs to each item's trigger (its title
+        // bar), not the accordion root, so clicking an item's content never
+        // toggles the accordion.
+        let on_toggle_click = self.on_toggle_click.filter(|_| !self.disabled);
 
         BaseAccordion::new(self.id)
             .v_flex()
@@ -135,29 +139,25 @@ impl RenderOnce for Accordion {
                             .disabled(self.disabled)
                             .on_toggle_click({
                                 let open_indices = open_indices.clone();
-                                move |open, _, _| {
-                                    let mut open_indices = open_indices.borrow_mut();
+                                let on_toggle_click = on_toggle_click.clone();
+                                move |open, window, cx| {
+                                    let mut indices = open_indices.borrow_mut();
                                     if *open {
                                         if !multiple {
-                                            open_indices.clear();
+                                            indices.clear();
                                         }
-                                        open_indices.insert(ix);
+                                        indices.insert(ix);
                                     } else {
-                                        open_indices.remove(&ix);
+                                        indices.remove(&ix);
+                                    }
+                                    let snapshot = indices.iter().copied().collect::<Vec<_>>();
+                                    drop(indices);
+                                    if let Some(on_toggle_click) = &on_toggle_click {
+                                        on_toggle_click(&snapshot, window, cx);
                                     }
                                 }
                             })
                     }),
-            )
-            .when_some(
-                self.on_toggle_click.filter(|_| !self.disabled),
-                |this, on_toggle| {
-                    this.on_click(move |_, window, cx| {
-                        let open_indices =
-                            open_indices.borrow().iter().copied().collect::<Vec<_>>();
-                        on_toggle(&open_indices, window, cx)
-                    })
-                },
             )
     }
 }
