@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    inline::{Inline, InlineState, TextFade},
+    inline::{self, Inline, InlineState, TextFade},
     node::LinkMark,
     utils::image_source,
 };
@@ -724,6 +724,9 @@ fn runs_for_highlights(
     let mut ix = 0;
 
     for (range, highlight) in highlights {
+        let Some(range) = inline::sanitized_range(text, range, ix) else {
+            continue;
+        };
         if ix < range.start {
             runs.push(default_style.clone().to_run(range.start - ix));
         }
@@ -758,9 +761,8 @@ fn slice_text_fades(fades: &[TextFade], start: usize, end: usize) -> Vec<TextFad
         .filter_map(|fade| {
             let overlap_start = fade.range.start.max(start);
             let overlap_end = fade.range.end.min(end);
-            (overlap_start < overlap_end).then(|| {
-                fade.with_range((overlap_start - start)..(overlap_end - start))
-            })
+            (overlap_start < overlap_end)
+                .then(|| fade.with_range((overlap_start - start)..(overlap_end - start)))
         })
         .collect()
 }

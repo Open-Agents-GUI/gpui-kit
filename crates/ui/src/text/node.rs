@@ -450,7 +450,12 @@ impl BlockNode {
                 }
             }
             BlockNode::CodeBlock(code_block) => {
+                #[cfg(debug_assertions)]
+                let code = code_block.code().to_string();
                 let len = code_block.code().len();
+                #[cfg(debug_assertions)]
+                set_state_fades(&code_block.state, *cursor, len, fades, &code);
+                #[cfg(not(debug_assertions))]
                 set_state_fades(&code_block.state, *cursor, len, fades);
                 *cursor += len;
             }
@@ -467,16 +472,35 @@ impl BlockNode {
     }
 }
 
-fn set_state_fades(state: &Arc<Mutex<InlineState>>, start: usize, len: usize, fades: &[TextFade]) {
+fn set_state_fades(
+    state: &Arc<Mutex<InlineState>>,
+    start: usize,
+    len: usize,
+    fades: &[TextFade],
+    #[cfg(debug_assertions)] run_text: &str,
+) {
     let end = start + len;
+    #[cfg(debug_assertions)]
+    for fade in fades {
+        let overlap_start = fade.range.start.max(start);
+        let overlap_end = fade.range.end.min(end);
+        assert!(
+            !(overlap_start < overlap_end)
+                || (run_text.is_char_boundary(overlap_start - start)
+                    && run_text.is_char_boundary(overlap_end - start)),
+            "fade range {:?} clipped to {:?} is not char-aligned with run text {:?}",
+            fade.range,
+            (overlap_start - start)..(overlap_end - start),
+            run_text,
+        );
+    }
     let local_fades = fades
         .iter()
         .filter_map(|fade| {
             let overlap_start = fade.range.start.max(start);
             let overlap_end = fade.range.end.min(end);
-            (overlap_start < overlap_end).then(|| {
-                fade.with_range((overlap_start - start)..(overlap_end - start))
-            })
+            (overlap_start < overlap_end)
+                .then(|| fade.with_range((overlap_start - start)..(overlap_end - start)))
         })
         .collect();
     if let Ok(mut state) = state.lock() {
@@ -1071,18 +1095,30 @@ impl Paragraph {
         }
 
         let mut run_len = 0;
+        #[cfg(debug_assertions)]
+        let mut run_text = String::new();
         for child in &self.children {
             if child.image.is_some() {
                 if run_len > 0 {
+                    #[cfg(debug_assertions)]
+                    set_state_fades(&child.state, *cursor, run_len, fades, &run_text);
+                    #[cfg(not(debug_assertions))]
                     set_state_fades(&child.state, *cursor, run_len, fades);
                     *cursor += run_len;
                     run_len = 0;
+                    #[cfg(debug_assertions)]
+                    run_text.clear();
                 }
             } else {
                 run_len += child.text.len();
+                #[cfg(debug_assertions)]
+                run_text.push_str(&child.text);
             }
         }
         if run_len > 0 {
+            #[cfg(debug_assertions)]
+            set_state_fades(&self.state, *cursor, run_len, fades, &run_text);
+            #[cfg(not(debug_assertions))]
             set_state_fades(&self.state, *cursor, run_len, fades);
             *cursor += run_len;
         }

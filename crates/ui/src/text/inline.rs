@@ -364,6 +364,29 @@ impl Inline {
     }
 }
 
+/// Snap a highlight range to char boundaries of `text`, clamped to the
+/// not-yet-consumed suffix that starts at `min_start`.
+///
+/// Highlight and fade ranges can be computed against a different revision of
+/// the text than the one being shaped (e.g. fades inherited across streaming
+/// appends). A range edge landing inside a multi-byte char would otherwise
+/// produce text runs that do not tile the text, which panics in
+/// `StyledText::with_runs`.
+pub(super) fn sanitized_range(
+    text: &str,
+    range: Range<usize>,
+    min_start: usize,
+) -> Option<Range<usize>> {
+    let mut start = range.start.max(min_start).min(text.len());
+    let mut end = range.end.clamp(start, text.len());
+    while start < end && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (start < end).then_some(start..end)
+}
 fn animated_highlights(
     text_len: usize,
     highlights: &[(Range<usize>, HighlightStyle)],
@@ -441,6 +464,20 @@ impl Element for Inline {
         let mut runs = Vec::new();
         let mut ix = 0;
         for (range, highlight) in highlights {
+            #[cfg(debug_assertions)]
+            assert!(
+                self.text.is_char_boundary(range.start) && self.text.is_char_boundary(range.end),
+                "highlight range {:?} is not char-aligned with text {:?} (fades: {:?})",
+                range,
+                self.text,
+                self.fades
+                    .iter()
+                    .map(|f| f.range.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let Some(range) = sanitized_range(&self.text, range, ix) else {
+                continue;
+            };
             if ix < range.start {
                 runs.push(text_style.clone().to_run(range.start - ix));
             }

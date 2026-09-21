@@ -295,8 +295,7 @@ impl TextViewState {
         reengagement: FollowTailReengagement,
         cx: &mut Context<Self>,
     ) {
-        self.list_state
-            .set_follow_tail_reengagement(reengagement);
+        self.list_state.set_follow_tail_reengagement(reengagement);
         cx.notify();
     }
 
@@ -368,12 +367,7 @@ impl TextViewState {
         self.set_text_inner(text, true, cx);
     }
 
-    fn set_text_inner(
-        &mut self,
-        text: &str,
-        preserve_layout: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_text_inner(&mut self, text: &str, preserve_layout: bool, cx: &mut Context<Self>) {
         if self.text.as_str() == text {
             return;
         }
@@ -536,7 +530,7 @@ impl TextViewState {
         &mut self,
         previous: &ParsedDocument,
         next: &ParsedDocument,
-        preserved_block_count: usize,
+        _preserved_block_count: usize,
         now: Instant,
         reduce_motion: bool,
     ) {
@@ -549,44 +543,13 @@ impl TextViewState {
             return;
         }
 
-        let mut next_fades = vec![Vec::new(); next.blocks.len()];
-        let preserved_block_count = preserved_block_count.min(next.blocks.len());
+        let next_fades = next_append_fades(previous, next, &self.append_fades, now, duration);
 
-        // For unchanged blocks, carry over their animations which are still valid.
-        for (ix, block) in next.blocks.iter().take(preserved_block_count).enumerate() {
-            let visible_end = block.text().trim_end_matches('\n').len();
-            inherit_active_fades(
-                &mut next_fades[ix],
-                self.append_fades.get(ix).map(Vec::as_slice),
-                visible_end,
-                now,
-            );
-        }
-
-        // The reparsed suffix can contain several old or newly created blocks.
-        // Preserve each block's stable rendered prefix, then animate its new suffix.
-        for (ix, next_block) in next.blocks.iter().enumerate().skip(preserved_block_count) {
-            let next_text = next_block.text();
-            let visible_end = next_text.trim_end_matches('\n').len();
-            let stable_prefix = previous
-                .blocks
-                .get(ix)
-                .map(|previous_block| common_prefix_len(&previous_block.text(), &next_text))
-                .unwrap_or(0)
-                .min(visible_end);
-
-            inherit_active_fades(
-                &mut next_fades[ix],
-                self.append_fades.get(ix).map(Vec::as_slice),
-                stable_prefix,
-                now,
-            );
-
-            if stable_prefix < visible_end {
-                next_fades[ix].push(TextFade::new(stable_prefix..visible_end, duration));
+        if cfg!(debug_assertions) {
+            for (ix, block) in next.blocks.iter().enumerate() {
+                debug_assert_fades_valid(&block.text(), &next_fades[ix]);
             }
         }
-
         self.append_fades = next_fades;
     }
 
@@ -852,6 +815,55 @@ impl Render for TextViewState {
     }
 }
 
+/// Build the append fades for `next` from the fades currently active on
+/// `previous`.
+///
+/// The stable prefix of each block is derived from `previous` and `next`
+/// directly rather than from the background parser's `preserved_block_count`.
+/// That count describes the parser's accumulated document, which can be a
+/// revision ahead of this state's copy whenever the parser produces results the
+/// receive loop discards. Applying it against a different baseline can line a
+/// stale fade range up with an unrelated block, landing the range inside a
+/// multi-byte character. [`common_prefix_len`] always snaps to a char boundary
+/// of `next`, so deriving the prefix locally keeps every range valid no matter
+/// how far ahead the parser has run.
+fn next_append_fades(
+    previous: &ParsedDocument,
+    next: &ParsedDocument,
+    existing: &[Vec<TextFade>],
+    now: Instant,
+    duration: Duration,
+) -> Vec<Vec<TextFade>> {
+    let mut next_fades = vec![Vec::new(); next.blocks.len()];
+
+    // Carry over still-running animations, then fade each block's newly appended
+    // suffix. For an unchanged block the common prefix is the whole block, so
+    // this matches the old "preserved block" fast path.
+    for (ix, next_block) in next.blocks.iter().enumerate() {
+        let next_text = next_block.text();
+        let visible_end = next_text.trim_end_matches('\n').len();
+        let stable_prefix = previous
+            .blocks
+            .get(ix)
+            .map(|previous_block| common_prefix_len(&previous_block.text(), &next_text))
+            .unwrap_or(0)
+            .min(visible_end);
+
+        inherit_active_fades(
+            &mut next_fades[ix],
+            existing.get(ix).map(Vec::as_slice),
+            stable_prefix,
+            now,
+        );
+
+        if stable_prefix < visible_end {
+            next_fades[ix].push(TextFade::new(stable_prefix..visible_end, duration));
+        }
+    }
+
+    next_fades
+}
+
 fn inherit_active_fades(
     target: &mut Vec<TextFade>,
     existing: Option<&[TextFade]>,
@@ -867,10 +879,25 @@ fn inherit_active_fades(
 
         if fade.range.start < end && !fade.is_complete_at(now) {
             Some(fade.with_range(fade.range.start..end))
-        }else {
+        } else {
             None
         }
     }));
+}
+
+/// Debug check: fade range edges must land on char boundaries of the block
+/// text they will be applied to, or run construction later panics.
+fn debug_assert_fades_valid(text: &str, fades: &[TextFade]) {
+    for fade in fades {
+        assert!(
+            text.is_char_boundary(fade.range.start)
+                && text.is_char_boundary(fade.range.end)
+                && fade.range.end <= text.len(),
+            "fade range {:?} is not valid for block text {:?}",
+            fade.range,
+            text,
+        );
+    }
 }
 
 fn common_prefix_len(left: &str, right: &str) -> usize {
@@ -1164,9 +1191,7 @@ fn blocks_have_same_layout(
         return false;
     };
     left_document.source.get(left_span.start..left_span.end)
-        == right_document
-            .source
-            .get(right_span.start..right_span.end)
+        == right_document.source.get(right_span.start..right_span.end)
 }
 
 #[cfg(test)]
@@ -1207,9 +1232,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn preserving_replacement_keeps_viewport_anchored_in_unchanged_suffix(
-        cx: &mut TestAppContext,
-    ) {
+    fn preserving_replacement_keeps_viewport_anchored_in_unchanged_suffix(cx: &mut TestAppContext) {
         cx.update(crate::init);
         let previous = "one\n\ntwo\n\nthree\n\nfour";
         let replacement = "one\n\ntwo\n\ninserted\n\nthree\n\nfour";
@@ -1288,6 +1311,51 @@ mod tests {
             append_reparse_range(&content.document).expect("append range");
         assert_eq!(preserved_block_count, 1);
         assert_eq!(start, "first paragraph\n\n".len());
+    }
+
+    #[test]
+    fn append_fades_stay_valid_when_the_previous_block_moved() {
+        let parse = |source: &str| {
+            parse_content(
+                TextViewFormat::Markdown,
+                ParsedContent::default(),
+                &UpdateOptions {
+                    revision: 1,
+                    pending_text: source.into(),
+                    append: false,
+                    mode: ParseMode::Replace,
+                    markdown_extensions: Arc::default(),
+                    preserve_layout: false,
+                    previous_document: None,
+                },
+            )
+            .expect("parse markdown")
+            .document
+        };
+        let duration = Duration::from_millis(200);
+
+        // The active fade was computed for the previous revision's second block,
+        // where byte 2 is a char boundary.
+        let previous = parse("first\n\nαα");
+        // A later revision replaced that block with one whose byte 2 splits a
+        // character. The background parser's `preserved_block_count` describes
+        // its own (ahead) document, so carrying `0..2` onto this block used to
+        // produce a range that does not tile the text and panicked in layout.
+        let next = parse("first\n\n中中");
+        let existing = vec![Vec::new(), vec![TextFade::new(0..2, duration)]];
+
+        let fades = next_append_fades(&previous, &next, &existing, Instant::now(), duration);
+
+        for (ix, block) in next.blocks.iter().enumerate() {
+            debug_assert_fades_valid(&block.text(), &fades[ix]);
+        }
+        assert_eq!(
+            fades[1]
+                .iter()
+                .map(|fade| fade.range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..6],
+        );
     }
 
     #[gpui::test]
