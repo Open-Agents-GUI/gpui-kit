@@ -1,7 +1,7 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::{cell::RefCell, sync::Arc};
 
 use gpui::{DefiniteLength, Hsla, SharedString, px, relative};
 use html5ever::tendril::TendrilSink;
@@ -75,7 +75,7 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
 
     Ok(ParsedDocument {
         source: source.to_string().into(),
-        blocks: vec![node].into(),
+        blocks: Arc::new(vec![node]).into(),
     })
 }
 
@@ -658,6 +658,8 @@ fn consume_paragraph(children: &mut Vec<BlockNode>, paragraph: &mut Paragraph) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use gpui::{px, relative};
 
     use crate::text::{
@@ -767,7 +769,7 @@ mod tests {
             node,
             ParsedDocument {
                 source: html.to_string().into(),
-                blocks: vec![BlockNode::Paragraph(Paragraph {
+                blocks: Arc::new(vec![BlockNode::Paragraph(Paragraph {
                     span: None,
                     children: vec![InlineNode::image(ImageNode {
                         url: "https://example.com/image.png".to_string().into(),
@@ -778,7 +780,7 @@ mod tests {
                         ..Default::default()
                     })],
                     ..Default::default()
-                })]
+                })])
             }
         );
 
@@ -788,7 +790,7 @@ mod tests {
             node,
             ParsedDocument {
                 source: html.to_string().into(),
-                blocks: vec![BlockNode::Paragraph(Paragraph {
+                blocks: Arc::new(vec![BlockNode::Paragraph(Paragraph {
                     span: None,
                     children: vec![InlineNode::image(ImageNode {
                         url: "https://example.com/image.png".to_string().into(),
@@ -799,7 +801,7 @@ mod tests {
                         ..Default::default()
                     })],
                     ..Default::default()
-                })]
+                })])
             }
         );
     }

@@ -2914,7 +2914,7 @@ mod tests {
 
         let document = ParsedDocument {
             source: source.into(),
-            blocks: vec![
+            blocks: Arc::new(vec![
                 BlockNode::Paragraph(selected_paragraph("start")),
                 BlockNode::List {
                     ordered: true,
@@ -2932,7 +2932,7 @@ mod tests {
                     }),
                 },
                 BlockNode::Paragraph(selected_paragraph("end")),
-            ],
+            ]),
         };
 
         assert_eq!(
@@ -2959,11 +2959,11 @@ mod tests {
 
         let document = ParsedDocument {
             source: source.into(),
-            blocks: vec![
+            blocks: Arc::new(vec![
                 BlockNode::Paragraph(selected_paragraph("before")),
                 BlockNode::Paragraph(image),
                 BlockNode::Paragraph(selected_paragraph("after")),
-            ],
+            ]),
         };
         assert_eq!(
             document.selected_text(SelectionFormat::Source, None),
@@ -2979,10 +2979,10 @@ mod tests {
         // it, is not enclosed and is dropped.
         let document = ParsedDocument {
             source: String::new().into(),
-            blocks: vec![
+            blocks: Arc::new(vec![
                 BlockNode::Paragraph(selected_paragraph("before")),
                 BlockNode::Paragraph(image_paragraph("alt", "u")),
-            ],
+            ]),
         };
         assert_eq!(
             document.selected_text(SelectionFormat::Source, None),
@@ -3048,7 +3048,7 @@ mod tests {
         // copied Markdown re-renders with the same structure.
         let document = ParsedDocument {
             source: String::new().into(),
-            blocks: vec![
+            blocks: Arc::new(vec![
                 BlockNode::Heading {
                     level: 1,
                     children: selected_paragraph("Title"),
@@ -3075,7 +3075,7 @@ mod tests {
                         },
                     ],
                 },
-            ],
+            ]),
         };
 
         assert_eq!(

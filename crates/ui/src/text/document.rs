@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, DefiniteLength, InteractiveElement as _, IntoElement, ListState,
-    ParentElement as _, SharedString, Styled as _, Window, div, prelude::*
+    ParentElement as _, SharedString, Styled as _, Window, div, prelude::*,
 };
 
 use std::{ops::RangeInclusive, sync::Arc};
